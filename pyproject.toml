@@ -13,12 +13,10 @@ dependencies = [
     "opencv-contrib-python>=4.9",
     "Pillow>=10.0",
     "reportlab>=4.0",
-    "scikit-image>=0.22",
 ]
 
 [project.optional-dependencies]
 ai = [
-    "anthropic>=0.34",
     "mediapipe>=0.10.14",
 ]
 demo = [

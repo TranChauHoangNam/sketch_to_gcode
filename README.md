@@ -3,6 +3,11 @@
 Desktop Tkinter app that converts sketch or line-art images into optimized
 G-code for a drawing robot.
 
+The main pipeline is intentionally focused on black/white sketch input:
+threshold ink, reduce strokes to centerlines, convert filled black regions to
+outline plus sparse diagonal hatch marks, then run an overlay QA pass to add
+any missing target strokes.
+
 ## Setup
 
 ```powershell

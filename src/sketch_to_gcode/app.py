@@ -14,9 +14,7 @@ import sys
 import time
 import threading
 import tempfile
-import base64
 import hashlib
-import json
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -105,13 +103,17 @@ OVERLAP_REDUCTION_FRACTION = 0.78
 OVERLAP_REDUCTION_ANGLE_DEG = 12.0
 OVERLAP_REDUCTION_GRID_MM = 6.0
 OVERLAP_REDUCTION_MAX_PATHS = 5200
-QA_MIN_ITERATIONS = 3
+QA_MIN_ITERATIONS = 1
 QA_TIMEOUT_S = 60.0
-QA_SSIM_THRESHOLD = 0.75
-QA_MODEL_PASS_THRESHOLD = 70.0
-QA_VISION_MODEL = "claude-sonnet-4-6"
 QA_RENDER_LINE_WIDTH_PX = 1
-QA_FACE_DETAIL_MIN_RATIO = 0.58
+QA_OVERLAY_REFERENCE_INK_THRESHOLD = 210
+QA_OVERLAY_PREVIEW_INK_THRESHOLD = 245
+QA_OVERLAY_TOLERANCE_PX = 3
+QA_OVERLAY_MIN_MISSING_PIXELS = 16
+QA_OVERLAY_MIN_MISSING_FRACTION = 0.006
+QA_OVERLAY_PASS_COVERAGE = 1.0 - QA_OVERLAY_MIN_MISSING_FRACTION
+QA_OVERLAY_MISSING_COMPONENT_MIN_AREA_PX = 8
+QA_OVERLAY_MAX_NEW_CANDIDATES = 120
 FACE_FIXED_BUDGET_RATIO = 0.26
 FACE_FIXED_BUDGET_MIN = 36
 FACE_FIXED_BUDGET_MAX_RATIO = 0.42
@@ -137,6 +139,21 @@ AUTO_BUDGET_BASE_SEGMENTS = 520
 AUTO_BUDGET_SQRT_SCALE = 12.0
 AUTO_BUDGET_MIN_SEGMENTS = 700
 AUTO_BUDGET_MAX_SEGMENTS = 2200
+LINE_ART_DARK_THRESHOLD = 120
+LINE_ART_LIGHT_THRESHOLD = 225
+LINE_ART_MAX_MIDTONE_FRACTION = 0.12
+LINE_ART_MIN_DARK_FRACTION = 0.0004
+LINE_ART_MAX_DARK_FRACTION = 0.34
+LINE_ART_TRACE_MIN_KEEP_PX = 14.0
+LINE_ART_AUTO_RDP_EPSILON_MM = 0.42
+LINE_ART_AUTO_BUDGET_HEADROOM = 1.18
+FILLED_REGION_MIN_AREA_PX = 24
+FILLED_REGION_MIN_SIZE_PX = 8
+FILLED_REGION_FILL_RATIO = 0.56
+FILLED_REGION_MAX_ASPECT = 8.0
+FILLED_REGION_MIN_DISTANCE_PX = 2.4
+FILLED_REGION_HATCH_SPACING_PX = 8
+FILLED_REGION_HATCH_ANGLE_DEG = -38.0
 
 VECTOR_MAX_DIM = 850
 HATCH_MAX_DIM = 900
@@ -627,6 +644,150 @@ def _normalize_u8(arr):
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _looks_like_clean_line_art_gray(gray):
+    """Detect black/white line-art so it is not edge-detected a second time."""
+    values = np.asarray(gray, dtype=np.uint8)
+    if values.size == 0:
+        return False
+    flat = values.reshape(-1)
+    dark_fraction = float(np.count_nonzero(flat <= LINE_ART_DARK_THRESHOLD)) / flat.size
+    light_fraction = float(np.count_nonzero(flat >= LINE_ART_LIGHT_THRESHOLD)) / flat.size
+    mid_fraction = 1.0 - dark_fraction - light_fraction
+    contrast = float(np.percentile(flat, 96) - np.percentile(flat, 4))
+    return (
+        contrast >= 95.0 and
+        light_fraction >= 0.52 and
+        LINE_ART_MIN_DARK_FRACTION <= dark_fraction <= LINE_ART_MAX_DARK_FRACTION and
+        mid_fraction <= LINE_ART_MAX_MIDTONE_FRACTION
+    )
+
+
+def _looks_like_clean_line_art(rgb):
+    arr = np.asarray(rgb, dtype=np.uint8)
+    if arr.ndim == 2:
+        gray = arr
+    else:
+        gray = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+    return _looks_like_clean_line_art_gray(gray)
+
+
+def _clean_line_art_binary_from_rgb(rgb, fg_mask):
+    """Extract actual ink from clean line-art with one threshold and light cleanup."""
+    arr = np.asarray(rgb, dtype=np.uint8)
+    gray = arr if arr.ndim == 2 else cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2GRAY)
+    if gray.size == 0:
+        return np.zeros_like(gray, dtype=np.uint8)
+
+    otsu_threshold, _ = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    ink_threshold = int(np.clip(max(150.0, otsu_threshold + 28.0), 80.0, 220.0))
+    binary = np.where(gray <= ink_threshold, 255, 0).astype(np.uint8)
+
+    fg = _resize_binary_mask(fg_mask, gray.shape[1], gray.shape[0])
+    if fg is not None and cv2.countNonZero(fg) > 0:
+        binary = cv2.bitwise_and(binary, fg)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    min_area = max(2, int(round(binary.size * 0.00001)))
+    return _adaptive_component_cleanup(binary, min_area=min_area)
+
+
+def _filled_component_score(comp, area, width, height):
+    if area < FILLED_REGION_MIN_AREA_PX:
+        return False, 0.0, 0.0
+    if min(width, height) < FILLED_REGION_MIN_SIZE_PX:
+        return False, 0.0, 0.0
+    aspect = max(width, height) / float(max(1, min(width, height)))
+    if aspect > FILLED_REGION_MAX_ASPECT:
+        return False, 0.0, aspect
+    fill_ratio = area / float(max(1, width * height))
+    if fill_ratio < FILLED_REGION_FILL_RATIO:
+        return False, fill_ratio, aspect
+    dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
+    max_dist = float(dist.max()) if dist.size else 0.0
+    return max_dist >= FILLED_REGION_MIN_DISTANCE_PX, fill_ratio, aspect
+
+
+def _diagonal_hatch_mask_for_component(comp, spacing_px=FILLED_REGION_HATCH_SPACING_PX,
+                                       angle_deg=FILLED_REGION_HATCH_ANGLE_DEG):
+    mask = np.where(np.asarray(comp, dtype=np.uint8) > 0, 255, 0).astype(np.uint8)
+    h, w = mask.shape
+    if h <= 1 or w <= 1 or cv2.countNonZero(mask) == 0:
+        return np.zeros_like(mask)
+
+    inset = 2 if min(w, h) >= 14 else 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    interior = cv2.erode(mask, kernel, iterations=inset)
+    if cv2.countNonZero(interior) == 0:
+        interior = mask
+
+    spacing = max(4, int(round(float(spacing_px))))
+    angle = math.radians(float(angle_deg))
+    direction = np.array([math.cos(angle), math.sin(angle)], dtype=np.float32)
+    normal = np.array([-direction[1], direction[0]], dtype=np.float32)
+    center = np.array([(w - 1) * 0.5, (h - 1) * 0.5], dtype=np.float32)
+    span = int(math.ceil(math.hypot(w, h))) + spacing + 2
+
+    lines = np.zeros_like(mask)
+    for offset in range(-span, span + 1, spacing):
+        p0 = center + normal * float(offset) - direction * float(span)
+        p1 = center + normal * float(offset) + direction * float(span)
+        cv2.line(
+            lines,
+            (int(round(p0[0])), int(round(p0[1]))),
+            (int(round(p1[0])), int(round(p1[1]))),
+            255,
+            thickness=1,
+            lineType=cv2.LINE_8,
+        )
+    return cv2.bitwise_and(lines, interior)
+
+
+def _symbolic_filled_component(comp):
+    comp = np.where(np.asarray(comp, dtype=np.uint8) > 0, 255, 0).astype(np.uint8)
+    out = np.zeros_like(comp)
+    contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(out, contours, -1, 255, 1, lineType=cv2.LINE_8)
+    hatch = _diagonal_hatch_mask_for_component(comp)
+    return cv2.bitwise_or(out, hatch)
+
+
+def _clean_line_art_draw_mask(binary_255):
+    """
+    Convert thresholded sketch ink into plotter strokes.
+
+    Thin line strokes are skeletonized to one centerline. Filled black regions
+    are rendered as an outline plus sparse diagonal hatching so the robot does
+    not waste commands filling a blob.
+    """
+    src = np.where(np.asarray(binary_255, dtype=np.uint8) > 0, 255, 0).astype(np.uint8)
+    if src.size == 0 or cv2.countNonZero(src) == 0:
+        return src, 0
+
+    out = np.zeros_like(src)
+    filled_count = 0
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(src, connectivity=8)
+    for lbl in range(1, num):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        x = int(stats[lbl, cv2.CC_STAT_LEFT])
+        y = int(stats[lbl, cv2.CC_STAT_TOP])
+        w = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        h = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        if area <= 0 or w <= 0 or h <= 0:
+            continue
+
+        comp = np.where(labels[y:y + h, x:x + w] == lbl, 255, 0).astype(np.uint8)
+        looks_filled, _fill_ratio, _aspect = _filled_component_score(comp, area, w, h)
+        rendered = _symbolic_filled_component(comp) if looks_filled else _thin_binary(comp)
+        if looks_filled:
+            filled_count += 1
+        out[y:y + h, x:x + w] = cv2.bitwise_or(out[y:y + h, x:x + w], rendered)
+
+    return np.where(out > 0, 255, 0).astype(np.uint8), filled_count
+
+
 def _adaptive_component_cleanup(binary_255, min_area=None):
     """Remove tiny connected components (noise/dust) while preserving real lines."""
     num, labels, stats, _ = cv2.connectedComponentsWithStats(binary_255, connectivity=8)
@@ -641,38 +802,8 @@ def _adaptive_component_cleanup(binary_255, min_area=None):
 
 
 def _force_outline_only(binary_255):
-    """Ep line-art ve dang vien mong, tranh giu lai mang den dac sau threshold."""
-    src = np.where(binary_255 > 0, 255, 0).astype(np.uint8)
-    if src.size == 0 or cv2.countNonZero(src) == 0:
-        return src
-
-    safe = np.zeros_like(src)
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(src, connectivity=8)
-    for lbl in range(1, num):
-        area = int(stats[lbl, cv2.CC_STAT_AREA])
-        x = int(stats[lbl, cv2.CC_STAT_LEFT])
-        y = int(stats[lbl, cv2.CC_STAT_TOP])
-        w = int(stats[lbl, cv2.CC_STAT_WIDTH])
-        h = int(stats[lbl, cv2.CC_STAT_HEIGHT])
-        if area <= 0 or w <= 0 or h <= 0:
-            continue
-
-        comp = np.where(labels[y:y + h, x:x + w] == lbl, 255, 0).astype(np.uint8)
-        fill_ratio = area / float(max(1, w * h))
-        looks_filled = area >= 80 and min(w, h) >= 7 and fill_ratio >= 0.38
-
-        if looks_filled:
-            # Vung den dac: chi ve contour, khong giu phan ruot bi threshold to kin.
-            contours, _ = cv2.findContours(comp, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-            comp_out = np.zeros_like(comp)
-            cv2.drawContours(comp_out, contours, -1, 255, 1, lineType=cv2.LINE_AA)
-            safe[y:y + h, x:x + w] = cv2.bitwise_or(safe[y:y + h, x:x + w], comp_out)
-        else:
-            # Net mong/net that: skeletonize truc tiep de khong tao hai vien song song.
-            safe[y:y + h, x:x + w] = cv2.bitwise_or(
-                safe[y:y + h, x:x + w], _thin_binary(comp))
-
-    return _thin_binary(safe)
+    mask, _filled_count = _clean_line_art_draw_mask(binary_255)
+    return mask
 
 
 def _apply_exclusion_mask(pil_img, exclude_bottom_pct=0.0, exclude_right_pct=0.0):
@@ -1199,92 +1330,33 @@ def transform_to_lineart(
     exclude_mask=None, return_mask_info=False
 ):
     """
-    Convert an already-sketch/line-art image into clean robot ink.
-    Returns black lines on white background. `exclude_mask` only clips hatch;
-    structural and detail edges remain intact.
+    Convert a black/white sketch into clean robot ink.
+
+    The robot should draw centerlines, not re-fill thick pixels. Filled black
+    regions are converted to outline plus sparse diagonal hatching.
     """
     rgb, fg_mask, mask_info = _composite_rgb_and_mask(
         pil_img, return_info=True)
     transform_to_lineart.last_foreground_mask_info = mask_info
 
-    lab    = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    l_chan = lab[:, :, 0]
-    a_chan = lab[:, :, 1].astype(np.float32)
-    b_chan = lab[:, :, 2].astype(np.float32)
-
-    clahe    = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-    l_enh    = clahe.apply(l_chan)
-    l_smooth = cv2.bilateralFilter(l_enh, d=5, sigmaColor=32, sigmaSpace=32)
-
-    fg_values  = l_smooth[fg_mask > 0]
-    median_l   = _safe_percentile(fg_values, 50, 128)
-    canny_low  = int(max(18, min(90,  0.42  * median_l)))
-    canny_high = int(max(canny_low + 25, min(190, 1.15 * median_l)))
-    structural = cv2.Canny(l_smooth, canny_low, canny_high, L2gradient=True)
-
-    if np.any(fg_mask == 0):
-        alpha_edge = cv2.Canny(fg_mask, 40, 120)
-        structural = cv2.bitwise_or(structural, alpha_edge)
-
-    g1    = cv2.GaussianBlur(l_enh, (0, 0), sigmaX=0.8)
-    g2    = cv2.GaussianBlur(l_enh, (0, 0), sigmaX=2.6)
-    dog   = cv2.absdiff(g1, g2)
-    dog_n = _normalize_u8(dog)
-
-    gx_l  = cv2.Scharr(l_enh, cv2.CV_32F, 1, 0)
-    gy_l  = cv2.Scharr(l_enh, cv2.CV_32F, 0, 1)
-    grad_l = _normalize_u8(cv2.magnitude(gx_l, gy_l))
-
-    dog_values  = dog_n[fg_mask > 0]
-    grad_values = grad_l[fg_mask > 0]
-    dog_thr     = max(12, int(_safe_percentile(dog_values,  80, 24)))
-    grad_thr    = max(18, int(_safe_percentile(grad_values, 72, 30)))
-
-    detail = np.where(
-        (dog_n >= dog_thr) & (grad_l >= int(grad_thr * 0.55)) & (fg_mask > 0),
-        255, 0,
-    ).astype(np.uint8)
-
-    gx_a       = cv2.Scharr(a_chan, cv2.CV_32F, 1, 0)
-    gy_a       = cv2.Scharr(a_chan, cv2.CV_32F, 0, 1)
-    gx_b       = cv2.Scharr(b_chan, cv2.CV_32F, 1, 0)
-    gy_b       = cv2.Scharr(b_chan, cv2.CV_32F, 0, 1)
-    mag_a      = cv2.magnitude(gx_a, gy_a)
-    mag_b      = cv2.magnitude(gx_b, gy_b)
-    chroma_mag = _normalize_u8(mag_a + mag_b)
-    chroma_values = chroma_mag[fg_mask > 0]
-    chroma_thr    = max(26, int(_safe_percentile(chroma_values, 86, 42)))
-    chroma_edge   = np.where(
-        (chroma_mag >= chroma_thr) & (fg_mask > 0), 255, 0
-    ).astype(np.uint8)
-
-    hatch_settings = hatch_settings or {}
-    hatch_vectors = _create_hatching_vectors(
-        l_enh,
-        fg_mask,
-        importance_map=(ai_maps.hatch_weight if ai_maps is not None else None),
-        exclude_mask=exclude_mask,
-        **hatch_settings,
-    )
-
-    ink = cv2.bitwise_or(structural, detail)
-    ink = cv2.bitwise_or(ink, chroma_edge)
-    # Hatch khong OR vao ink nua: giu vector hatch rieng de khong bi raster/skeleton lam vo stroke.
-    ink = cv2.bitwise_and(ink, fg_mask)
-
-    small_kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, small_kernel, iterations=1)
-    ink = _adaptive_component_cleanup(ink, min_area=3)
-    # Chot chan sau threshold/Canny/hatching: chi giu outline mong de tranh vung den bi to dac.
-    ink = _force_outline_only(ink)
-
-    result = np.full_like(ink, 255)
-    result[ink > 0] = 0
+    ink = _clean_line_art_binary_from_rgb(rgb, fg_mask)
+    draw_mask, filled_count = _clean_line_art_draw_mask(ink)
+    result = np.full_like(draw_mask, 255)
+    result[draw_mask > 0] = 0
     pil_lineart = Image.fromarray(result)
+    pil_lineart.info["vector_mode"] = "clean_lineart"
+    pil_lineart.info["contains_symbolic_fills"] = bool(filled_count)
+    pil_lineart.info["filled_region_count"] = int(filled_count)
+    print(
+        "Line-art pipeline: threshold -> centerline, "
+        f"ink={int(cv2.countNonZero(ink))}, "
+        f"draw={int(cv2.countNonZero(draw_mask))}, "
+        f"filled_regions={filled_count}"
+    )
     if return_hatch_vectors and return_mask_info:
-        return pil_lineart, hatch_vectors, mask_info
+        return pil_lineart, [], mask_info
     if return_hatch_vectors:
-        return pil_lineart, hatch_vectors
+        return pil_lineart, []
     if return_mask_info:
         return pil_lineart, mask_info
     return pil_lineart
@@ -1505,6 +1577,47 @@ def _trace_skeleton_paths(skeleton):
             trails.append(trail)
 
     return trails
+
+
+def _pixel_trail_length_px(trail):
+    if len(trail) < 2:
+        return 0.0
+    pts = np.asarray([(float(c), float(r)) for r, c in trail], dtype=np.float32)
+    return float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
+
+
+def _filter_short_trace_artifacts(pixel_trails, min_length_px=LINE_ART_TRACE_MIN_KEEP_PX):
+    """
+    Drop tiny leftover graph trails from thinned clean line-art.
+
+    Thinning curved, anti-aliased black strokes often creates local 2x2 stair
+    steps. In an 8-neighbor graph those become fake junctions, so edge traversal
+    leaves many 2-12 px fragments after the real long stroke has already been
+    traced. These are not separate plotter strokes.
+    """
+    trails = [trail for trail in pixel_trails if len(trail) >= 2]
+    if len(trails) < 24:
+        return trails
+
+    lengths = [_pixel_trail_length_px(trail) for trail in trails]
+    long_exists = any(length > float(min_length_px) * 2.0 for length in lengths)
+    if not long_exists:
+        return trails
+
+    kept = [
+        trail for trail, length in zip(trails, lengths)
+        if length >= float(min_length_px)
+    ]
+    if not kept:
+        return trails
+
+    removed = len(trails) - len(kept)
+    if removed:
+        print(
+            f"  Trace artifact filter: {len(trails)} -> {len(kept)} trails "
+            f"(removed {removed} fragments < {float(min_length_px):.1f}px)"
+        )
+    return kept
 
 
 def _polyline_turn_saliency(points):
@@ -1943,6 +2056,12 @@ def extract_candidate_paths(pil_lineart, reference_img=None, ai_maps=None,
     """
     gray  = np.array(pil_lineart.convert("L"))
     h0, w0 = gray.shape
+    explicit_clean_lineart = (
+        getattr(pil_lineart, "info", {}).get("vector_mode") == "clean_lineart"
+    )
+    has_symbolic_fills = bool(
+        getattr(pil_lineart, "info", {}).get("contains_symbolic_fills")
+    )
 
     scale_factor = min(1.0, VECTOR_MAX_DIM / max(h0, w0))
     if scale_factor < 1.0:
@@ -1950,10 +2069,12 @@ def extract_candidate_paths(pil_lineart, reference_img=None, ai_maps=None,
         new_h = max(1, int(h0 * scale_factor))
         gray  = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
     h, w = gray.shape
+    clean_lineart = explicit_clean_lineart or _looks_like_clean_line_art_gray(gray)
 
     binary  = np.where(gray < 180, 255, 0).astype(np.uint8)
-    close_k = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-    binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k, iterations=1)
+    if not explicit_clean_lineart:
+        close_k = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        binary  = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_k, iterations=1)
 
     skeleton      = _thin_binary(binary)
     ref_grad      = _reference_gradient_map(reference_img, w, h)
@@ -1962,6 +2083,10 @@ def extract_candidate_paths(pil_lineart, reference_img=None, ai_maps=None,
     ai_subject = _resize_ai_map(
         ai_maps.foreground if ai_maps is not None else None, w, h, binary=True)
     pixel_trails  = _trace_skeleton_paths(skeleton)
+    if clean_lineart:
+        min_keep_px = 5.0 if has_symbolic_fills else LINE_ART_TRACE_MIN_KEEP_PX
+        pixel_trails = _filter_short_trace_artifacts(
+            pixel_trails, min_length_px=min_keep_px)
 
     candidates = []
     for trail in pixel_trails:
@@ -2334,8 +2459,6 @@ def _candidate_rdp_epsilon(candidate, epsilon):
     region = getattr(candidate, "region", "detail")
     if region == "face" or getattr(candidate, "protected", False):
         return min(float(epsilon), FACE_RDP_EPSILON_MM)
-    if candidate.detail_tier == 0 or region == "garment_outline":
-        return min(float(epsilon), MAIN_OUTLINE_RDP_EPSILON_MM)
     return float(epsilon)
 
 
@@ -2419,6 +2542,7 @@ def _select_candidates_for_budget(candidates, target):
         # many short fragments with similar saliency and aggregate length.
         continuity_bonus = 0.55 * length_value if c.detail_tier == 2 else 0.0
         region = getattr(c, "region", "detail")
+        source = getattr(c, "source", "")
         region_bonus = (
             0.72 if region == "face"
             else 0.46 if region == "garment_outline"
@@ -2426,6 +2550,8 @@ def _select_candidates_for_budget(candidates, target):
             else -0.10 if region == "hatch"
             else 0.0
         )
+        if source == "qa_overlay_add":
+            region_bonus += 0.90
         protected_bonus = 0.40 if getattr(c, "protected", False) else 0.0
         values.append(
             (c.saliency if c.saliency > 0 else c.importance) * 3.2 +
@@ -2454,6 +2580,31 @@ def _select_candidates_for_budget(candidates, target):
         selected.append(chosen)
         cost += _candidate_min_segment_cost(chosen)
         cur = chosen.points[-1]
+
+    qa_repair_indexes = sorted(
+        [
+            i for i, c in enumerate(pool)
+            if active[i] and getattr(c, "source", "") == "qa_overlay_add"
+        ],
+        key=lambda i: values[i],
+        reverse=True,
+    )
+    qa_repair_cost = 0
+    qa_repair_cap = min(target, max(60, int(target * 0.40)))
+    for i in qa_repair_indexes:
+        min_cost = _candidate_min_segment_cost(pool[i])
+        if min_cost <= 0 or cost + min_cost > target:
+            continue
+        if qa_repair_cost + min_cost > qa_repair_cap and qa_repair_cost > 0:
+            continue
+        select_index(i)
+        qa_repair_cost += min_cost
+    if qa_repair_indexes:
+        print(
+            f"  Overlay repair budget: selected "
+            f"{sum(1 for c in selected if getattr(c, 'source', '') == 'qa_overlay_add')} "
+            f"(cost {qa_repair_cost}/{qa_repair_cap})"
+        )
 
     face_indexes = sorted(
         [
@@ -2635,6 +2786,8 @@ def _candidate_stroke_count_score(candidate):
         else -0.18 if region == "hatch"
         else 0.0
     )
+    if getattr(candidate, "source", "") == "qa_overlay_add":
+        region_bonus += 0.90
     protected_bonus = 0.7 if getattr(candidate, "protected", False) else 0.0
     return float(visual) * 3.0 + length_score * 2.2 + tier_bonus + region_bonus + protected_bonus
 
@@ -2649,9 +2802,7 @@ def _apply_stroke_count_soft_cap(selected, target_segments):
         return selected
     protected = [
         c for c in selected
-        if getattr(c, "protected", False) or getattr(c, "region", "") in {
-            "face", "garment_outline"
-        }
+        if getattr(c, "protected", False) or getattr(c, "region", "") == "face"
     ]
     protected_ids = {id(c) for c in protected}
     removable = [c for c in selected if id(c) not in protected_ids]
@@ -2663,6 +2814,44 @@ def _apply_stroke_count_soft_cap(selected, target_segments):
         f"selected candidates (cap {cap}, protected {len(protected)}, target {target} segments)"
     )
     return retained
+
+
+def suggest_auto_detail_budget(candidates):
+    """
+    Estimate a sane detail budget from simplified geometry, not raw pixels.
+
+    Raw skeleton points can be huge for anti-aliased line art. Auto mode should
+    describe the number of useful plotter segments after curve simplification.
+    """
+    pool = [c for c in candidates or [] if len(getattr(c, "points", ())) >= 2]
+    if not pool:
+        return DEFAULT_STROKE_BUDGET
+
+    simplified_segments = 0
+    for candidate in pool:
+        region = getattr(candidate, "region", "detail")
+        if region == "face" or getattr(candidate, "protected", False):
+            epsilon = FACE_RDP_EPSILON_MM
+        elif getattr(candidate, "source", "") == "hatch":
+            epsilon = max(LINE_ART_AUTO_RDP_EPSILON_MM, 0.70)
+        elif int(getattr(candidate, "detail_tier", 1)) == 0:
+            epsilon = max(LINE_ART_AUTO_RDP_EPSILON_MM * 0.72, 0.28)
+        else:
+            epsilon = LINE_ART_AUTO_RDP_EPSILON_MM
+        simplified = _adaptive_rdp_simplify(candidate.points, epsilon)
+        simplified_segments += max(
+            _candidate_min_segment_cost(candidate),
+            max(0, len(simplified) - 1),
+        )
+
+    stroke_headroom = min(260.0, len(pool) * 0.75)
+    suggested = int(round(
+        (simplified_segments * LINE_ART_AUTO_BUDGET_HEADROOM + stroke_headroom) / 100.0
+    ) * 100)
+    return max(
+        MIN_STROKE_BUDGET,
+        min(AUTO_BUDGET_MAX_SEGMENTS, suggested),
+    )
 
 
 def _fit_paths_to_budget(candidates, target_segments):
@@ -4925,26 +5114,6 @@ def _as_gray_array(image, size=None):
     return arr.astype(np.uint8)
 
 
-def score_fidelity(preview_img, reference_lineart_img):
-    """Return SSIM fidelity score in the 0..1 range."""
-    preview = _as_gray_array(preview_img)
-    reference = _as_gray_array(reference_lineart_img, size=(preview.shape[1], preview.shape[0]))
-    try:
-        from skimage.metrics import structural_similarity
-        score = float(structural_similarity(reference, preview, data_range=255))
-    except Exception as error:
-        ref_ink = reference < 220
-        prev_ink = preview < 245
-        if not bool(np.any(ref_ink | prev_ink)):
-            score = 1.0
-        else:
-            intersection = float(np.count_nonzero(ref_ink & prev_ink))
-            denom = float(np.count_nonzero(ref_ink) + np.count_nonzero(prev_ink))
-            score = 2.0 * intersection / max(1.0, denom)
-        print(f"QA fidelity warning: skimage SSIM unavailable, using ink Dice ({error})")
-    return float(np.clip(score, 0.0, 1.0))
-
-
 def _path_hash(paths):
     digest = hashlib.sha256()
     for path in paths:
@@ -4964,192 +5133,173 @@ def _render_plan_preview_cached(plan, canvas_size, cache):
     return preview
 
 
-def _image_to_png_b64(image, max_dim=900):
-    if isinstance(image, Image.Image):
-        pil = image.convert("RGB")
-    else:
-        arr = _as_gray_array(image)
-        pil = Image.fromarray(arr).convert("RGB")
-    pil.thumbnail((int(max_dim), int(max_dim)), Image.Resampling.LANCZOS)
-    buffer = tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024)
-    pil.save(buffer, format="PNG")
-    buffer.seek(0)
-    data = buffer.read()
-    buffer.close()
-    return base64.b64encode(data).decode("ascii")
 
-
-def _extract_json_object(text):
-    if not text:
-        return {}
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        return json.loads(match.group(0))
-    except Exception:
-        return {}
-
-
-def _call_anthropic_vision_qa(original_img, preview_img, timeout_s=18.0):
-    prompt = (
-        "You are reviewing a plotter/robot drawing preview. Compare image 1 "
-        "(source) and image 2 (rendered G-code preview). Return JSON only with "
-        "keys: fidelity_score (0-100), redundancy_notes, missing_detail_notes. "
-        "Judge likeness to the source portrait/product and whether strokes are "
-        "redundant, overlapping, or missing important facial/product details."
+def _overlay_missing_mask(plan, reference_lineart_img, render_cache=None):
+    canvas_size = reference_lineart_img.size
+    preview = (
+        _render_plan_preview_cached(plan, canvas_size, render_cache)
+        if render_cache is not None else
+        render_gcode_preview_to_image(plan.paths, canvas_size)
     )
-    content = [
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": _image_to_png_b64(original_img),
-            },
-        },
-        {
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/png",
-                "data": _image_to_png_b64(preview_img),
-            },
-        },
-        {"type": "text", "text": prompt},
+    reference = _as_gray_array(reference_lineart_img, size=canvas_size)
+    ref_ink = reference < QA_OVERLAY_REFERENCE_INK_THRESHOLD
+    ref_pixels = int(np.count_nonzero(ref_ink))
+    if ref_pixels == 0:
+        return {
+            "preview": preview,
+            "missing_mask": np.zeros_like(reference, dtype=np.uint8),
+            "coverage": 1.0,
+            "missing_pixels": 0,
+            "missing_fraction": 0.0,
+            "reference_pixels": 0,
+        }
+
+    prev_ink = np.where(
+        preview < QA_OVERLAY_PREVIEW_INK_THRESHOLD, 255, 0).astype(np.uint8)
+    tolerance = max(0, int(QA_OVERLAY_TOLERANCE_PX))
+    if tolerance:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (tolerance * 2 + 1, tolerance * 2 + 1))
+        covered = cv2.dilate(prev_ink, kernel, iterations=1) > 0
+    else:
+        covered = prev_ink > 0
+
+    missing = np.where(ref_ink & ~covered, 255, 0).astype(np.uint8)
+    missing = _adaptive_component_cleanup(
+        missing, min_area=QA_OVERLAY_MISSING_COMPONENT_MIN_AREA_PX)
+    missing_pixels = int(cv2.countNonZero(missing))
+    missing_fraction = missing_pixels / float(max(1, ref_pixels))
+    return {
+        "preview": preview,
+        "missing_mask": missing,
+        "coverage": float(np.clip(1.0 - missing_fraction, 0.0, 1.0)),
+        "missing_pixels": missing_pixels,
+        "missing_fraction": float(missing_fraction),
+        "reference_pixels": ref_pixels,
+    }
+
+
+def _missing_mask_to_candidates(missing_mask, reference_lineart_img,
+                                face_mask=None,
+                                max_new=QA_OVERLAY_MAX_NEW_CANDIDATES):
+    missing = np.where(np.asarray(missing_mask, dtype=np.uint8) > 0, 255, 0)
+    if missing.size == 0 or cv2.countNonZero(missing) == 0:
+        return []
+
+    repair_img = np.full_like(missing, 255, dtype=np.uint8)
+    repair_img[missing > 0] = 0
+    pil_missing = Image.fromarray(repair_img)
+    pil_missing.info["vector_mode"] = "clean_lineart"
+    pil_missing.info["contains_symbolic_fills"] = True
+    raw = extract_candidate_paths(
+        pil_missing,
+        reference_img=reference_lineart_img,
+        face_mask=face_mask,
+    )
+    ranked = sorted(
+        raw,
+        key=lambda c: (
+            _candidate_mask_overlap(c, face_mask, canvas_size=reference_lineart_img.size)
+            if face_mask is not None else 0.0,
+            c.length_mm,
+            c.saliency,
+        ),
+        reverse=True,
+    )
+
+    promoted = []
+    for candidate in ranked[:max(1, int(max_new))]:
+        repaired = _candidate_with_points(
+            candidate, candidate.points.copy(), source="qa_overlay_add")
+        face_overlap = _candidate_mask_overlap(
+            repaired, face_mask, canvas_size=reference_lineart_img.size)
+        repaired.importance = 1.0
+        repaired.saliency = 1.0
+        repaired.detail_tier = 0
+        repaired.region = "face" if face_overlap >= 0.18 else "garment_detail"
+        repaired.protected = True
+        repaired.classifier_scores["qa_overlay"] = {
+            "missing_repair": True,
+            "face_overlap": float(face_overlap),
+        }
+        promoted.append(repaired)
+    return promoted
+
+
+def _overlay_repair_budget(plan, budget, additions):
+    if not additions:
+        return int(budget)
+    repair_paths = [
+        _adaptive_rdp_simplify(
+            candidate.points,
+            _candidate_rdp_epsilon(candidate, FACE_RDP_EPSILON_MM),
+        )
+        for candidate in additions
+        if len(candidate.points) >= 2
     ]
-
-    try:
-        from anthropic import Anthropic
-        message = Anthropic(timeout=timeout_s).messages.create(
-            model=QA_VISION_MODEL,
-            max_tokens=700,
-            messages=[{"role": "user", "content": content}],
-        )
-        text = "\n".join(
-            block.text for block in message.content
-            if getattr(block, "type", None) == "text" and hasattr(block, "text")
-        )
-        payload = _extract_json_object(text)
-        payload["status"] = "ok"
-        return payload
-    except Exception as sdk_error:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            return {
-                "status": f"unavailable: {type(sdk_error).__name__}: {sdk_error}",
-                "fidelity_score": None,
-                "redundancy_notes": "",
-                "missing_detail_notes": "Anthropic SDK/API key unavailable.",
-            }
-        try:
-            import urllib.request
-            payload = {
-                "model": QA_VISION_MODEL,
-                "max_tokens": 700,
-                "messages": [{"role": "user", "content": content}],
-            }
-            req = urllib.request.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "content-type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout_s) as response:
-                raw = json.loads(response.read().decode("utf-8"))
-            text = "\n".join(
-                block.get("text", "") for block in raw.get("content", [])
-                if block.get("type") == "text"
-            )
-            data = _extract_json_object(text)
-            data["status"] = "ok"
-            return data
-        except Exception as http_error:
-            return {
-                "status": f"unavailable: {type(http_error).__name__}: {http_error}",
-                "fidelity_score": None,
-                "redundancy_notes": "",
-                "missing_detail_notes": str(http_error),
-            }
+    repair_segments = _count_segments(repair_paths)
+    repair_cost = sum(_candidate_min_segment_cost(candidate) for candidate in additions)
+    return int(min(
+        MAX_STROKE_BUDGET,
+        max(
+            MIN_STROKE_BUDGET,
+            int(budget),
+            int(plan.actual_segments) + max(24, repair_segments + repair_cost * 2),
+        ),
+    ))
 
 
-def _model_reports_redundancy(notes):
-    text = (notes or "").strip().lower()
-    if not text:
-        return False
-    harmless = ("none", "no redundancy", "no redundant", "khong", "không", "n/a", "ok")
-    return not any(marker in text for marker in harmless)
+def repair_missing_details_with_overlay(candidates, plan, budget,
+                                        reference_lineart_img, face_mask=None,
+                                        render_cache=None):
+    before = _overlay_missing_mask(plan, reference_lineart_img, render_cache)
+    stats = {
+        "coverage_before": before["coverage"],
+        "coverage_after": before["coverage"],
+        "missing_pixels_before": before["missing_pixels"],
+        "missing_pixels_after": before["missing_pixels"],
+        "missing_fraction_before": before["missing_fraction"],
+        "missing_fraction_after": before["missing_fraction"],
+        "reference_pixels": before["reference_pixels"],
+        "added_candidates": 0,
+        "accepted": False,
+    }
+    needs_repair = (
+        before["missing_pixels"] >= QA_OVERLAY_MIN_MISSING_PIXELS and
+        before["missing_fraction"] >= QA_OVERLAY_MIN_MISSING_FRACTION
+    )
+    if not needs_repair:
+        return list(candidates), plan, stats
 
+    additions = _missing_mask_to_candidates(
+        before["missing_mask"],
+        reference_lineart_img,
+        face_mask=face_mask,
+    )
+    stats["added_candidates"] = len(additions)
+    if not additions:
+        return list(candidates), plan, stats
 
-def _face_detail_ratio(plan, face_mask, reference_lineart_img):
-    if face_mask is None or cv2.countNonZero(np.asarray(face_mask, dtype=np.uint8)) == 0:
-        return 1.0
-    width, height = reference_lineart_img.size
-    mask = _resize_binary_mask(face_mask, width, height)
-    if mask is None or cv2.countNonZero(mask) == 0:
-        return 1.0
-    reference = _as_gray_array(reference_lineart_img)
-    preview = render_gcode_preview_to_image(plan.paths, (width, height))
-    ref_ink = (reference < 210) & (mask > 0)
-    if np.count_nonzero(ref_ink) < 20:
-        return 1.0
-    prev_ink = np.where(preview < 245, 255, 0).astype(np.uint8)
-    prev_ink = cv2.dilate(prev_ink, cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (3, 3)), iterations=1) > 0
-    covered = np.count_nonzero(ref_ink & prev_ink)
-    return float(covered) / float(max(1, np.count_nonzero(ref_ink)))
+    repaired_candidates, _ = _deduplicate_candidates(list(candidates) + additions)
+    repaired_budget = _overlay_repair_budget(plan, budget, additions)
+    repaired_plan = build_gcode_plan(repaired_candidates, repaired_budget)
+    after = _overlay_missing_mask(repaired_plan, reference_lineart_img, render_cache)
+    stats.update({
+        "coverage_after": after["coverage"],
+        "missing_pixels_after": after["missing_pixels"],
+        "missing_fraction_after": after["missing_fraction"],
+        "accepted": after["missing_pixels"] < before["missing_pixels"],
+    })
+    if not stats["accepted"]:
+        return list(candidates), plan, stats
 
-
-def _point_in_face_mask_mm(point, face_mask, canvas_size):
-    if face_mask is None:
-        return False
-    width, height = _normalize_canvas_size(canvas_size)
-    mask = _resize_binary_mask(face_mask, width, height)
-    if mask is None:
-        return False
-    x, y = _fit_page_to_pixel(point[0], point[1], width, height)
-    return bool(mask[y, x] > 0)
-
-
-def _boost_face_detail_candidates(candidates, face_mask, canvas_size):
-    if face_mask is None or cv2.countNonZero(np.asarray(face_mask, dtype=np.uint8)) == 0:
-        return list(candidates), 0
-    boosted = []
-    changed = 0
-    for candidate in candidates:
-        if not isinstance(candidate, CandidatePath) or len(candidate.points) < 2:
-            boosted.append(candidate)
-            continue
-        stride = max(1, len(candidate.points) // 16)
-        samples = candidate.points[::stride]
-        face_hits = sum(
-            1 for point in samples
-            if _point_in_face_mask_mm(point, face_mask, canvas_size)
-        )
-        face_fraction = face_hits / max(1, len(samples))
-        if face_fraction <= 0.18:
-            boosted.append(candidate)
-            continue
-        promoted = _candidate_with_points(candidate, candidate.points.copy())
-        promoted.importance = max(promoted.importance, 0.96)
-        promoted.detail_tier = 0
-        promoted.saliency = max(promoted.saliency, 0.95)
-        promoted.region = "face"
-        promoted.protected = True
-        promoted.classifier_scores["qa_face_boost"] = True
-        boosted.append(promoted)
-        changed += 1
-    if changed:
-        print(f"QA face detail boost: promoted {changed} candidate strokes")
-    return boosted, changed
+    print(
+        "QA overlay repair: "
+        f"missing {before['missing_pixels']} -> {after['missing_pixels']} px, "
+        f"coverage {before['coverage']:.3f} -> {after['coverage']:.3f}, "
+        f"added={len(additions)}, budget={repaired_budget}"
+    )
+    return repaired_candidates, repaired_plan, stats
 
 
 def _qa_iteration_from_plan(index, plan, ssim_score, changes, elapsed_s,
@@ -5185,142 +5335,92 @@ def run_quality_gate(candidates, budget, reference_lineart_img,
     candidate_source = list(candidates)
     best_plan = initial_plan if initial_plan is not None else build_gcode_plan(
         candidate_source, budget)
-    adjusted_candidates = candidate_source
 
     def elapsed():
         return time.perf_counter() - started
 
-    def timed_out():
-        return elapsed() >= float(timeout_s)
-
-    def assess(index, plan, changes, model_result=None):
+    def assess(index, plan, changes):
         t0 = time.perf_counter()
-        preview = _render_plan_preview_cached(plan, canvas_size, render_cache)
-        ssim_score = score_fidelity(preview, reference_lineart_img)
+        overlay = _overlay_missing_mask(plan, reference_lineart_img, render_cache)
         iter_elapsed = time.perf_counter() - t0
         iteration = _qa_iteration_from_plan(
-            index, plan, ssim_score, changes, iter_elapsed, model_result)
+            index, plan, overlay["coverage"], changes, iter_elapsed)
+        iteration.missing_detail_notes = (
+            f"missing={overlay['missing_pixels']}px "
+            f"({overlay['missing_fraction'] * 100.0:.2f}%)"
+        )
         print(
-            f"QA iteration {index}: SSIM={ssim_score:.3f}, "
-            f"model={iteration.model_score if iteration.model_score is not None else '--'}, "
+            f"QA overlay {index}: coverage={overlay['coverage']:.3f}, "
+            f"missing={overlay['missing_pixels']}px, "
             f"strokes={plan.stroke_count}, lifts={plan.pen_lifts}, "
             f"elapsed={iter_elapsed:.2f}s"
         )
         iterations.append(iteration)
-        return iteration, preview
+        return iteration, overlay
 
-    iter1, preview = assess(1, best_plan, ["Initial preview plan"])
-    best_ssim = iter1.ssim
+    iter1, overlay1 = assess(1, best_plan, ["Overlay check against target ink"])
+    best_coverage = iter1.ssim
+    final_overlay = overlay1
 
-    has_face_mask = (
-        face_mask is not None and
-        cv2.countNonZero(np.asarray(face_mask, dtype=np.uint8)) > 0
-    )
-    face_ratio = _face_detail_ratio(best_plan, face_mask, reference_lineart_img)
-    needs_face_boost = has_face_mask and face_ratio < QA_FACE_DETAIL_MIN_RATIO
-    needs_more_detail = has_face_mask and iter1.ssim < QA_SSIM_THRESHOLD
-    if not timed_out() and (needs_face_boost or needs_more_detail):
-        adjusted_candidates, boosted_count = _boost_face_detail_candidates(
-            candidate_source, face_mask, canvas_size)
-        adjusted_budget = int(budget)
-        changes = []
-        if needs_face_boost and boosted_count:
-            changes.append(
-                f"Promoted {boosted_count} face-region strokes before budget selection")
-        if needs_more_detail:
-            adjusted_budget = min(
-                MAX_STROKE_BUDGET,
-                max(int(budget) + 100, int(round(float(budget) * 1.08))),
+    if elapsed() < float(timeout_s):
+        candidate_source, repaired_plan, overlay_stats = \
+            repair_missing_details_with_overlay(
+                candidate_source,
+                best_plan,
+                budget,
+                reference_lineart_img,
+                face_mask=face_mask,
+                render_cache=render_cache,
             )
-            changes.append(
-                f"Raised detail budget {int(budget)} -> {adjusted_budget} to reduce RDP loss")
-        if not changes:
-            changes.append("Rebuilt with same settings after face-detail check")
-        plan2 = build_gcode_plan(adjusted_candidates, adjusted_budget)
-        iter2, preview2 = assess(2, plan2, changes)
-        stroke_growth = (
-            (plan2.stroke_count - best_plan.stroke_count) /
-            max(1.0, float(best_plan.stroke_count))
-        )
-        quality_gain = iter2.ssim - best_ssim
-        if (needs_face_boost or
-                (iter2.ssim + 0.01 >= best_ssim and stroke_growth <= 0.20) or
-                quality_gain >= 0.08):
-            best_plan = plan2
-            best_ssim = iter2.ssim
-            preview = preview2
-    else:
-        note = (
-            "SSIM below threshold; kept current budget because no face-detail mask is active"
-            if iter1.ssim < QA_SSIM_THRESHOLD and not has_face_mask
-            else "No parameter change needed; cached preview reused"
-        )
-        iter2, preview = assess(
-            2, best_plan, [note])
-        best_ssim = max(best_ssim, iter2.ssim)
-
-    if timed_out():
-        model_result = {
-            "status": "timeout",
-            "fidelity_score": None,
-            "redundancy_notes": "",
-            "missing_detail_notes": "QA timeout reached before model gate.",
-        }
-    else:
-        model_result = _call_anthropic_vision_qa(
-            original_img if original_img is not None else reference_lineart_img,
-            preview,
-            timeout_s=max(6.0, min(18.0, float(timeout_s) - elapsed())),
-        )
-
-    plan3 = best_plan
-    changes = [f"Vision model gate attempted: {model_result.get('status', 'unknown')}"]
-    model_score = model_result.get("fidelity_score")
-    try:
-        model_score_value = None if model_score is None else float(model_score)
-    except Exception:
-        model_score_value = None
-    if (not timed_out() and
-            (model_score_value is not None and model_score_value < QA_MODEL_PASS_THRESHOLD or
-             _model_reports_redundancy(model_result.get("redundancy_notes")))):
-        plan3 = build_gcode_plan(
-            adjusted_candidates,
-            best_plan.target_segments,
-            merge_angle_tolerance_deg=18.0,
-            merge_endpoint_gap_mm=0.90,
-        )
-        changes.append("Applied looser final merge for reported redundancy")
-
-    iter3, preview3 = assess(3, plan3, changes, model_result=model_result)
-    if iter3.ssim + 0.005 >= best_ssim or plan3.stroke_count < best_plan.stroke_count:
-        best_plan = plan3
-        best_ssim = iter3.ssim
-        preview = preview3
+        if overlay_stats.get("accepted"):
+            best_plan = repaired_plan
+            changes = [
+                "Overlay repair added "
+                f"{overlay_stats['added_candidates']} missing strokes",
+                "Coverage "
+                f"{overlay_stats['coverage_before']:.3f} -> "
+                f"{overlay_stats['coverage_after']:.3f}",
+            ]
+            iter2, final_overlay = assess(2, best_plan, changes)
+            best_coverage = max(best_coverage, iter2.ssim)
+        else:
+            best_coverage = max(best_coverage, overlay_stats["coverage_after"])
+            final_overlay = {
+                **final_overlay,
+                "coverage": overlay_stats["coverage_after"],
+                "missing_pixels": overlay_stats["missing_pixels_after"],
+                "missing_fraction": overlay_stats["missing_fraction_after"],
+            }
 
     total_time = elapsed()
     timed_out_flag = total_time >= float(timeout_s)
-    final_model_score = iterations[-1].model_score
+    final_missing_fraction = float(final_overlay.get("missing_fraction", 0.0))
+    final_missing_pixels = int(final_overlay.get("missing_pixels", 0))
     passed = (
         len(iterations) >= QA_MIN_ITERATIONS and
-        best_ssim >= QA_SSIM_THRESHOLD and
-        final_model_score is not None and
-        final_model_score >= QA_MODEL_PASS_THRESHOLD and
+        (best_coverage >= QA_OVERLAY_PASS_COVERAGE or
+         final_missing_pixels < QA_OVERLAY_MIN_MISSING_PIXELS) and
         not timed_out_flag
     )
     report = QAReport(
         iterations=iterations,
         final_stroke_count=int(best_plan.stroke_count),
-        final_ssim=float(best_ssim),
-        final_model_score=final_model_score,
+        final_ssim=float(best_coverage),
+        final_model_score=None,
         passed=bool(passed),
         timed_out=bool(timed_out_flag),
         total_time_s=float(total_time),
-        model_status=str(model_result.get("status", "unknown")),
+        model_status=(
+            "overlay_only"
+            f": missing {final_missing_pixels}px "
+            f"({final_missing_fraction * 100.0:.2f}%)"
+        ),
     )
     best_plan.qa_report = report
     print(
-        f"QA report: passed={report.passed}, final_ssim={report.final_ssim:.3f}, "
-        f"model={report.final_model_score if report.final_model_score is not None else '--'}, "
+        f"QA overlay report: passed={report.passed}, "
+        f"coverage={report.final_ssim:.3f}, "
+        f"missing={final_missing_pixels}px, "
         f"strokes={report.final_stroke_count}, time={report.total_time_s:.2f}s"
     )
     return best_plan, report
@@ -6799,18 +6899,14 @@ class App:
         if report is None:
             return "QA: waiting for preview"
         state = "PASS" if report.passed else "REVIEW"
-        lines = [f"QA: {state}  ({len(report.iterations)}/{QA_MIN_ITERATIONS}, {report.total_time_s:.1f}s)"]
-        for iteration in report.iterations[:QA_MIN_ITERATIONS]:
-            model = (
-                f" / M{iteration.model_score:.0f}"
-                if iteration.model_score is not None else ""
-            )
+        lines = [f"QA: {state} overlay ({report.total_time_s:.1f}s)"]
+        for iteration in report.iterations:
             lines.append(
-                f"{iteration.index}. S{iteration.ssim:.2f}{model} | "
+                f"{iteration.index}. C{iteration.ssim:.2f} | "
                 f"{iteration.stroke_count} strokes | {iteration.pen_lifts} lifts"
             )
-        if report.model_status and report.model_status != "ok":
-            lines.append(f"Model: {report.model_status[:48]}")
+        if report.model_status:
+            lines.append(report.model_status[:64])
         return "\n".join(lines)
 
     def _refresh_export_buttons(self):
@@ -7503,11 +7599,7 @@ class App:
 
         raw_total = sum(max(1, len(c.points) - 1) for c in candidates)
         self.last_raw_segments = raw_total
-        # Goi y budget theo do phuc tap contour: anh cang nhieu path/segment thi tang budget.
-        complexity_boost = min(1.0, len(candidates) / 1800.0)
-        suggest_ratio = 0.55 + 0.25 * complexity_boost
-        self.auto_budget = max(MIN_STROKE_BUDGET,
-                               min(MAX_STROKE_BUDGET, int(raw_total * suggest_ratio)))
+        self.auto_budget = suggest_auto_detail_budget(candidates)
         if self.auto_detail_var.get():
             self.detail_slider_var.set(self.auto_budget)
             self.detail_value_var.set(self._format_budget(self.auto_budget))
@@ -7664,7 +7756,7 @@ class App:
         qa_id = self._qa_job_id
         image_job_id = self._image_job_id
         self.current_qa_report = None
-        self.qa_status_var.set(f"QA: running 0/{QA_MIN_ITERATIONS} checks...")
+        self.qa_status_var.set("QA: running overlay check...")
         self.card_gcode.set_status("QA...", Theme.ACCENT_BLUE)
         self._refresh_export_buttons()
 
@@ -7746,7 +7838,7 @@ class App:
         if not force and not self._qa_allows_export():
             messagebox.showwarning(
                 "QA Gate Required",
-                "Export is enabled only after the 3-pass QA gate passes.\n"
+                "Export is enabled only after the overlay QA gate passes.\n"
                 "Wait for QA to finish, adjust settings, or use Force export.")
             return
         if force:

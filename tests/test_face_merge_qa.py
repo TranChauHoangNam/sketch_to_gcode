@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -180,7 +179,7 @@ class FaceMergeQATests(unittest.TestCase):
         self.assertGreaterEqual(stats["merged_count"], 2)
         self.assertGreaterEqual(stats["overlap_removed_count"], 1)
 
-    def test_quality_gate_runs_three_iterations(self):
+    def test_quality_gate_uses_overlay_only(self):
         reference = Image.new("L", (80, 80), 255)
         candidates = [
             app.CandidatePath(
@@ -192,23 +191,18 @@ class FaceMergeQATests(unittest.TestCase):
             )
         ]
 
-        with patch.object(app, "_call_anthropic_vision_qa", return_value={
-            "status": "ok",
-            "fidelity_score": 82,
-            "redundancy_notes": "",
-            "missing_detail_notes": "",
-        }):
-            plan, report = app.run_quality_gate(
-                candidates,
-                app.MIN_STROKE_BUDGET,
-                reference,
-                original_img=reference,
-                timeout_s=30.0,
-            )
+        plan, report = app.run_quality_gate(
+            candidates,
+            app.MIN_STROKE_BUDGET,
+            reference,
+            original_img=reference,
+            timeout_s=30.0,
+        )
 
         self.assertIs(plan.qa_report, report)
         self.assertEqual(len(report.iterations), app.QA_MIN_ITERATIONS)
-        self.assertEqual(report.final_model_score, 82.0)
+        self.assertIsNone(report.final_model_score)
+        self.assertIn("overlay_only", report.model_status)
 
 
 if __name__ == "__main__":

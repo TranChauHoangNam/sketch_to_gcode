@@ -1,7 +1,20 @@
-"""Technical reporting for the sketch-to-G-code pipeline."""
+"""Compatibility wrapper for ``sketch_to_gcode.reporting``."""
 
-from .generator import ReportConfig, ReportGenerator, generate_pdf_report, generate_report
-from .metrics import build_report_data
-from .models import ReportData
+from __future__ import annotations
 
-__all__ = ["ReportConfig", "ReportData", "ReportGenerator", "build_report_data", "generate_report", "generate_pdf_report"]
+import sys
+from pathlib import Path
+
+
+_ROOT = Path(__file__).resolve().parent.parent
+_SRC = _ROOT / "src"
+_IMPL_DIR = _SRC / "sketch_to_gcode" / "reporting"
+
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+__path__ = [str(_IMPL_DIR)]
+
+from sketch_to_gcode.reporting import *  # noqa: F401,F403
+
+del Path, sys

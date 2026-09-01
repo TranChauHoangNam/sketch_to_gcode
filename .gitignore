@@ -1,1 +1,11 @@
 *.pyc
+__pycache__/
+.pytest_cache/
+.venv/
+.uv-cache/
+.uv-python/
+build/
+dist/
+*.egg-info/
+*.gcode
+*.pdf

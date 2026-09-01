@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sketch-to-gcode"
+version = "0.1.0"
+description = "Desktop image-to-G-code tool for a drawing robot."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-contrib-python>=4.9",
+    "Pillow>=10.0",
+    "reportlab>=4.0",
+    "scikit-image>=0.22",
+]
+
+[project.optional-dependencies]
+ai = [
+    "anthropic>=0.34",
+    "mediapipe>=0.10.14",
+]
+demo = [
+    "matplotlib>=3.8",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+sketch-to-gcode = "sketch_to_gcode.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
